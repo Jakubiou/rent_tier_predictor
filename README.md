@@ -1,1 +1,1 @@
-# rental_quality_predictor
+# rent_tier_predictor
