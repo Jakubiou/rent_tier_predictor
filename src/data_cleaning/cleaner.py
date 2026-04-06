@@ -1,59 +1,44 @@
-import os
-import logging
+import os, json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
-    handlers=[
-        logging.FileHandler("cleaner.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
-log = logging.getLogger(__name__)
+from sklearn.preprocessing import LabelEncoder
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-INPUT_FILE   = os.path.join(PROJECT_ROOT, "data", "raw_listings.csv")
-OUTPUT_CLEAN = os.path.join(PROJECT_ROOT, "data", "clean_listings.csv")
-OUTPUT_NORM  = os.path.join(PROJECT_ROOT, "data", "clean_listings_normalized.csv")
-POI_COLS     = ["skola_m", "park_m", "mhd_m", "lekarna_m", "supermarket_m"]
+INPUT_FILE = os.path.join(PROJECT_ROOT, "data", "raw_listings1.csv")
+OUTPUT_CLEAN = os.path.join(PROJECT_ROOT, "data", "clean_listings1.csv")
+CITY_INDEX_FILE = os.path.join(PROJECT_ROOT, "data", "city_price_index1.json")
+TIER_META_FILE = os.path.join(PROJECT_ROOT, "data", "tier_meta1.json")
+PHOTO_SCORE_PATH = os.path.join(PROJECT_ROOT, "data", "photo_quality1.json")
 
-def load(path: str) -> pd.DataFrame:
+POI_COLS = ["skola_m", "park_m", "mhd_m", "lekarna_m", "supermarket_m"]
+MIN_CITY_DISP = 100
+
+
+def load(path):
     df = pd.read_csv(path, encoding="utf-8-sig")
-    log.info(f"Načteno {len(df)} řádků, {len(df.columns)} sloupců")
     return df
 
 
-def clean(df: pd.DataFrame) -> pd.DataFrame:
-    original_len = len(df)
-
+def clean(df):
     df = df.drop_duplicates(subset="id")
-    log.info(f"Po odstranění duplicit: {len(df)} (smazáno {original_len - len(df)})")
 
     df["plocha_m2"] = df["nazev"].str.extract(r"(\d+)\s*m²").astype(float)
-    log.info(f"Plocha parsována z názvu: {df['plocha_m2'].notna().sum()} / {len(df)}")
-
     df["cena_kc"] = pd.to_numeric(df["cena_kc"], errors="coerce")
-    df = df[df["cena_kc"].between(2_000, 150_000)].copy()
-    log.info(f"Po filtraci cen [2k–150k Kč]: {len(df)}")
 
+    df = df[df["cena_kc"].between(2_000, 150_000)].copy()
     df = df[df["plocha_m2"].between(10, 500)].copy()
-    log.info(f"Po filtraci plochy [10–500 m²]: {len(df)}")
 
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
-    mask_gps = df["lat"].between(48.5, 51.1) & df["lon"].between(12.1, 18.9)
-    df = df[mask_gps].copy()
-    log.info(f"Po filtraci GPS: {len(df)}")
+    mask = df["lat"].between(48.5, 51.1) & df["lon"].between(12.1, 18.9)
+    df = df[mask].copy()
 
     for col in POI_COLS:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").clip(upper=5000)
 
-    log.info(f"Čištění hotovo. Výsledek: {len(df)} řádků")
     return df.reset_index(drop=True)
+
 
 DISPOSITION_MAP = {
     "garsonka": 1, "garsoniéra": 1,
@@ -64,7 +49,7 @@ DISPOSITION_MAP = {
 }
 
 
-def extract_disposition_score(nazev: str) -> int:
+def extract_disposition_score(nazev):
     if not isinstance(nazev, str):
         return 3
     nazev_lower = nazev.lower()
@@ -74,100 +59,123 @@ def extract_disposition_score(nazev: str) -> int:
     return 3
 
 
-def add_features(df: pd.DataFrame) -> pd.DataFrame:
-
+def add_features(df):
     df["dispozice_skore"] = df["nazev"].apply(extract_disposition_score)
 
     df["mesto"] = (
-        df["lokalita"]
-        .str.split(",").str[-1]
-        .str.split(" - ").str[0]
-        .str.strip()
+        df["lokalita"].str.split(",").str[-1]
+        .str.split(" - ").str[0].str.strip()
     )
-
-    df["velke_mesto"] = df["mesto"].str.lower().str.contains(
-        r"prah|brno|ostrava", na=False
-    ).astype(int)
 
     df["mhd_dostupnost"] = (df["mhd_m"].fillna(1000) / 1000).clip(0, 1).round(3)
 
-    log.info("Feature engineering hotov")
+    for col in POI_COLS:
+        med = df[col].median()
+        df[col] = df[col].fillna(med)
+
     return df
 
 
-def add_price_tier(df: pd.DataFrame) -> pd.DataFrame:
-    t1 = df["cena_kc"].quantile(0.33)
-    t2 = df["cena_kc"].quantile(0.66)
+def add_photo_score(df):
+    if os.path.exists(PHOTO_SCORE_PATH):
+        with open(PHOTO_SCORE_PATH, encoding="utf-8") as f:
+            photo_map = json.load(f)
+        df["photo_score"] = df["id"].astype(str).map(photo_map)
+        df["photo_score"] = df["photo_score"].fillna(df["photo_score"].median())
+    else:
+        df["photo_score"] = 0.5
+    return df
 
-    df["cenove_pasmo"] = pd.cut(
-        df["cena_kc"],
-        bins=[-np.inf, t1, t2, np.inf],
-        labels=[1, 2, 3],
+
+def build_city_price_index(df):
+    df = df.copy()
+    df["_cpm2"] = df["cena_kc"] / df["plocha_m2"].replace(0, np.nan)
+    counts = df.groupby("mesto")["_cpm2"].count()
+    means = df.groupby("mesto")["_cpm2"].mean()
+    global_mean = df["_cpm2"].mean()
+
+    index = {
+        city: round(float(means[city]), 1) if counts[city] >= 10
+              else round(float(global_mean), 1)
+        for city in means.index
+    }
+    with open(CITY_INDEX_FILE, "w", encoding="utf-8") as f:
+        json.dump({"global_mean": round(global_mean, 1), "cities": index},
+                  f, ensure_ascii=False, indent=2)
+    return index, global_mean
+
+
+def encode_mesto(df):
+    le = LabelEncoder()
+    df["mesto_enc"] = le.fit_transform(df["mesto"].fillna("neznámo"))
+    return df, le
+
+
+def add_price_tier(df):
+    counts = df.groupby(["mesto", "dispozice_skore"]).size()
+    city_med = df.groupby(["mesto", "dispozice_skore"])["cena_kc"].median()
+    disp_med = df.groupby("dispozice_skore")["cena_kc"].median()
+
+    ref_medians = []
+    for _, row in df.iterrows():
+        key = (row["mesto"], row["dispozice_skore"])
+        if counts.get(key, 0) >= MIN_CITY_DISP:
+            ref_medians.append(float(city_med.get(key, disp_med[row["dispozice_skore"]])))
+        else:
+            ref_medians.append(float(disp_med[row["dispozice_skore"]]))
+
+    df["ref_median"] = ref_medians
+    df["cena_rel"] = (df["cena_kc"] / df["ref_median"]).round(4)
+
+    t1_rel = float(df["cena_rel"].quantile(0.30))
+    t2_rel = float(df["cena_rel"].quantile(0.70))
+
+    df["tier"] = pd.cut(
+        df["cena_rel"],
+        bins=[-np.inf, t1_rel, t2_rel, np.inf],
+        labels=[0, 1, 2],
     ).astype(int)
 
-    log.info(f"Tercilové hranice: levný < {t1:.0f} Kč | střední < {t2:.0f} Kč | drahý")
-    dist = df["cenove_pasmo"].value_counts().sort_index()
-    log.info(f"Distribuce cenových pásem:\n{dist.to_string()}")
-    return df
+    disp_names = {1: "Garsoniéra", 2: "1+kk / 1+1", 3: "2+kk / 2+1",
+                  4: "3+kk / 3+1", 5: "4+kk a více"}
+    tier_meta = {
+        "t1_rel": t1_rel,
+        "t2_rel": t2_rel,
+        "per_disp": {
+            int(d): {
+                "name": disp_names.get(d, str(d)),
+                "median": round(float(disp_med[d])),
+                "t1_abs": round(float(disp_med[d]) * t1_rel),
+                "t2_abs": round(float(disp_med[d]) * t2_rel),
+                "n": int((df["dispozice_skore"] == d).sum()),
+            }
+            for d in sorted(df["dispozice_skore"].unique())
+        },
+        "city_disp_medians": {
+            f"{m}|{int(d)}": round(float(v))
+            for (m, d), v in city_med.items()
+            if counts.get((m, d), 0) >= MIN_CITY_DISP
+        },
+        "disp_medians": {int(d): round(float(v)) for d, v in disp_med.items()},
+    }
+    with open(TIER_META_FILE, "w", encoding="utf-8") as f:
+        json.dump(tier_meta, f, ensure_ascii=False, indent=2)
 
-
-def preprocess(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    top_mesta = df["mesto"].value_counts().nlargest(15).index
-    df["mesto_group"] = df["mesto"].where(df["mesto"].isin(top_mesta), other="ostatni")
-    mesto_dummies = pd.get_dummies(df["mesto_group"], prefix="mesto")
-    df = pd.concat([df, mesto_dummies], axis=1)
-
-    drop_cols = [
-        "id", "nazev", "lokalita", "zdroj",
-        "lat", "lon",
-        "mesto", "mesto_group",
-        "cena_kc",
-    ]
-    df_model = df.drop(columns=[c for c in drop_cols if c in df.columns])
-
-    numeric_cols = df_model.select_dtypes(include=[np.number]).columns.tolist()
-    for col in numeric_cols:
-        missing = df_model[col].isna().sum()
-        if missing > 0:
-            med = df_model[col].median()
-            log.info(f"  Imputuji '{col}': {missing} NaN → {med:.1f}")
-            df_model[col] = df_model[col].fillna(med)
-
-    feature_cols = [
-        c for c in numeric_cols
-        if c != "cenove_pasmo" and not c.startswith("mesto_")
-    ]
-    scaler = MinMaxScaler()
-    df_normed = df_model.copy()
-    df_normed[feature_cols] = scaler.fit_transform(df_model[feature_cols])
-
-    log.info(f"Preprocessing hotov. Features: {feature_cols}")
-    return df_model, df_normed
+    return df, t1_rel, t2_rel, city_med, disp_med, counts
 
 
 def main():
-    log.info("=" * 60)
-    log.info("Spuštěn cleaner.py")
-
     df = load(INPUT_FILE)
     df = clean(df)
     df = add_features(df)
-    df = add_price_tier(df)
+    df = add_photo_score(df)
+    df, _ = encode_mesto(df)
+
+    build_city_price_index(df)
+
+    df, t1, t2, city_med, disp_med, counts = add_price_tier(df)
 
     df.to_csv(OUTPUT_CLEAN, index=False, encoding="utf-8-sig")
-    log.info(f"Čistá data uložena → {OUTPUT_CLEAN}")
-
-    df_model, df_normed = preprocess(df)
-    df_normed.to_csv(OUTPUT_NORM, index=False, encoding="utf-8-sig")
-    log.info(f"Normalizovaná data uložena → {OUTPUT_NORM}")
-
-    log.info("\n--- Přehled ---")
-    log.info(f"Řádků: {len(df)}")
-    log.info(f"Sloupců modelu: {len(df_model.columns)}")
-    log.info(f"Chybějící POI hodnoty:\n{df[POI_COLS].isna().sum().to_string()}")
-    log.info(f"Statistiky ceny:\n{df['cena_kc'].describe().round(0).to_string()}")
-    log.info(f"Statistiky plochy:\n{df['plocha_m2'].describe().round(1).to_string()}")
-    log.info("=" * 60)
 
 
 if __name__ == "__main__":
